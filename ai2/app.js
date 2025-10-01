@@ -2,21 +2,23 @@
 
 /**
  * BeloCloud Actions mini-server (no external deps).
+ *
  * Endpoints:
- *   GET  /ai2/              -> "AppJS ACTIVE"
- *   GET  /ai2/_health       -> { ok:true, time: ... }
- *   POST /ai2/diff_submit   -> enqueue a Base64 (or base64url) unified diff
- *   POST /ai2/echo          -> debug echo; shows headers/body + decoded preview
+ *   GET  /ai2/                 -> "AppJS ACTIVE"
+ *   GET  /ai2/_health          -> { ok:true, time: ... }
+ *   GET  /ai2/health           -> alias of /ai2/_health
+ *   GET  /ai2/static/<file>    -> serve ./public/<file> (json/text only)
+ *   POST /ai2/diff_submit      -> enqueue a Base64 (or base64url) unified diff
+ *   POST /ai2/echo             -> debug echo; shows headers/body + decoded preview
  *
- * Only accepts application/json bodies for /ai2/diff_submit with:
- *   { base_branch: "main", message?: "...", diff_b64: "<base64>", idempotency_key? }
- *
- * Auth:
- *   Header X-Api-Key must equal token in /home/genweb/agent/ACTION_TOKEN
- *
- * Idempotency:
- *   Header X-Idempotency-Key preferred. If missing, body.idempotency_key is used.
- *   Creates .idem-<key> file pointing to queued job to dedupe replays.
+ * Notes
+ * - Only accepts application/json bodies for /ai2/diff_submit:
+ *     { base_branch:"main", message?: "...", diff_b64:"<base64>", idempotency_key? }
+ * - Auth for /ai2/diff_submit:
+ *     Header X-Api-Key must equal token in /home/genweb/agent/ACTION_TOKEN
+ * - Idempotency:
+ *     Header X-Idempotency-Key preferred (or body.idempotency_key). Creates
+ *     .idem-<key> file pointing to queued job to dedupe replays.
  */
 
 const http   = require('http');
@@ -26,10 +28,11 @@ const crypto = require('crypto');
 const url    = require('url');
 
 // --- config/paths ---
-const TOKEN_FILE = '/home/genweb/agent/ACTION_TOKEN';
-const QUEUE_DIR  = '/home/genweb/agent/queue';
-const DEBUG_LOG  = '/home/genweb/agent/last_action_debug.log';
-const MAX_BYTES  = 512 * 1024;
+const TOKEN_FILE  = '/home/genweb/agent/ACTION_TOKEN';
+const QUEUE_DIR   = '/home/genweb/agent/queue';
+const DEBUG_LOG   = '/home/genweb/agent/last_action_debug.log';
+const STATIC_ROOT = path.join(__dirname, 'public');
+const MAX_BYTES   = 512 * 1024;
 
 // --- state/init ---
 let ACTION_TOKEN = '';
@@ -90,7 +93,7 @@ function sendText(res, code, text) {
 
 // --- core validation for diffs ---
 function validateBase64Chars(b64) {
-  // allow std + url-safe: A-Za-z0-9+/_= - (dash)
+  // allow std + url-safe: A-Za-z0-9+/_= and dash
   return /^[A-Za-z0-9+/_=-]+$/.test(b64);
 }
 function containsControlBytes(s) {
@@ -103,9 +106,7 @@ function containsControlBytes(s) {
  * Returns { ok:true } or { ok:false, error:'...' }
  */
 function validateUnifiedDiff(diff) {
-  if (!/^diff --git /m.test(diff)) {
-    return { ok:false, error:'diff_invalid_format' };
-  }
+  if (!/^diff --git /m.test(diff)) return { ok:false, error:'diff_invalid_format' };
 
   // If this looks like a new file diff, enforce invariants.
   if (/(^|\n)new file mode \d+/.test(diff)) {
@@ -120,10 +121,9 @@ function validateUnifiedDiff(diff) {
     }
     // Require at least one hunk with -0,0 +N
     const hunk = diff.match(/(^|\n)@@ -0,0 \+(\d+) @@/);
-    if (!hunk) {
-      return { ok:false, error:'bad_hunk_header_for_new_file' };
-    }
-    // Optional: sanity—ensure we don't have fewer '+' lines than N
+    if (!hunk) return { ok:false, error:'bad_hunk_header_for_new_file' };
+
+    // Optional sanity—ensure we don't have fewer '+' lines than N
     const expected = parseInt(hunk[2], 10);
     const plusLines = diff.split('\n').filter(line => {
       if (!line.startsWith('+')) return false;
@@ -133,8 +133,45 @@ function validateUnifiedDiff(diff) {
       return { ok:false, error:'hunk_content_lines_mismatch' };
     }
   }
-
   return { ok:true };
+}
+
+// --- tiny static server: /ai2/static/* -> ./public/*  (read-only; json/text only) ---
+function serveStatic(req, res, parsedPathname) {
+  // Only allow GET or HEAD
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+
+  // Accept /ai2/static/* and /static/* (second form helps local testing)
+  if (!parsedPathname.startsWith('/ai2/static/') && !parsedPathname.startsWith('/static/')) return false;
+
+  const rel = parsedPathname.replace(/^\/(ai2\/)?static\//, '');         // strip prefix
+  // normalize: disallow path traversal
+  const safeRel = rel.split('/').filter(seg => seg && seg !== '.' && seg !== '..').join('/');
+  const file = path.join(STATIC_ROOT, safeRel);
+
+  try {
+    // must be under STATIC_ROOT
+    const real = fs.realpathSync(file);
+    if (!real.startsWith(STATIC_ROOT)) {
+      sendText(res, 403, 'Forbidden\n'); return true;
+    }
+    if (!fs.existsSync(real) || !fs.statSync(real).isFile()) {
+      sendText(res, 404, 'Not Found\n'); return true;
+    }
+
+    // Very small content-type map (json & text by default)
+    let ct = 'text/plain; charset=UTF-8';
+    if (/\.json$/i.test(real)) ct = 'application/json; charset=UTF-8';
+    else if (/\.txt$/i.test(real)) ct = 'text/plain; charset=UTF-8';
+    else if (/\.log$/i.test(real)) ct = 'text/plain; charset=UTF-8';
+
+    const data = fs.readFileSync(real);
+    res.writeHead(200, { 'Content-Type': ct, 'Cache-Control': 'no-cache' });
+    if (req.method === 'HEAD') { res.end(); } else { res.end(data); }
+  } catch (e) {
+    sendText(res, 500, 'Static error\n');
+  }
+  return true;
 }
 
 // --- handlers ---
@@ -201,16 +238,10 @@ function handleDiffSubmit(req, res) {
     const diff = fromAnyB64(diff_b64_raw);
     logDbg({ time: nowISO(), tag: 'DECODED_HEAD', preview: diff.slice(0, 200) });
 
-    if (!diff) {
-      return sendJSON(res, 400, { ok:false, error:'diff_b64_decode_failed' });
-    }
-    if (containsControlBytes(diff)) {
-      return sendJSON(res, 400, { ok:false, error:'diff_contains_control_bytes' });
-    }
+    if (!diff)                        return sendJSON(res, 400, { ok:false, error:'diff_b64_decode_failed' });
+    if (containsControlBytes(diff))   return sendJSON(res, 400, { ok:false, error:'diff_contains_control_bytes' });
     const v = validateUnifiedDiff(diff);
-    if (!v.ok) {
-      return sendJSON(res, 400, { ok:false, error: v.error });
-    }
+    if (!v.ok)                        return sendJSON(res, 400, { ok:false, error: v.error });
 
     // --- idempotency dedupe ---
     let idemPointerFile = '';
@@ -232,7 +263,7 @@ function handleDiffSubmit(req, res) {
       ip: ipOf(req),
       ua: String(req.headers['user-agent'] || ''),
       base_branch: base,
-      message: (rawMessage || `ChatGPT change ${nowISO()}`), // default if missing/empty
+      message: (rawMessage || `ChatGPT change ${nowISO()}`),
       diff,
       sha256: sha256(diff)
     };
@@ -254,14 +285,17 @@ function handleDiffSubmit(req, res) {
 function handler(req, res) {
   const p = (url.parse(req.url).pathname || '');
 
+  // static files first (cheap, no body read)
+  if (serveStatic(req, res, p)) return;
+
   // health
   if (req.method === 'GET' && (p === '/ai2/_health' || p === '/_health')) {
     return sendJSON(res, 200, { ok:true, time: nowISO() });
   }
-// compatibility: /ai2/health and /health -> same as /ai2/_health
-if (req.method === 'GET' && (p === '/ai2/health' || p === '/health')) {
-  return sendJSON(res, 200, { ok:true, time: nowISO() });
-}
+  // compatibility: /ai2/health and /health -> same as /ai2/_health
+  if (req.method === 'GET' && (p === '/ai2/health' || p === '/health')) {
+    return sendJSON(res, 200, { ok:true, time: nowISO() });
+  }
 
   // echo
   if (req.method === 'POST' && (p === '/ai2/echo' || p === '/echo')) {
