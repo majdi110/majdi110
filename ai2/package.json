@@ -1,0 +1,7 @@
+{
+  "name": "belocloud-actions",
+  "private": true,
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "build": "echo \"(no build step yet)\"" },
+  "dependencies": { "express": "^4.19.2" }
+}
