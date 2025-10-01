@@ -1,0 +1,20 @@
+# --- ai2 app ---
+/ai2/node_modules/
+/ai2/tmp/
+/ai2/*.log
+/ai2/debug.log
+
+# env & credentials
+/.env
+/ai2/.env
+
+# Apache / Passenger / cPanel noise
+/.htaccess
+/ai2/.htaccess
+/.well-known/
+/cgi-bin/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
