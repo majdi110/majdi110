@@ -18,3 +18,25 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+node_modules/
+tmp/
+.htaccess
+*.log
+VERSION.txt
+# secrets/keys
+vps_deploy_key
+vps_deploy_key.pub
+/home/genweb/.deploykeys/
+# Node + runtime junk
+ai2/node_modules/
+ai2/tmp/
+ai2/*.log
+ai2/VERSION.txt
+# Apache/cPanel files
+.htaccess
+ai2/.htaccess
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp

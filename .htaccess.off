@@ -1,0 +1,11 @@
+# Route /ai2 to a Node (Passenger) app in this directory
+PassengerAppRoot /home/genweb/public_html/datav.belocloud.com/ai2
+PassengerBaseURI /ai2
+PassengerAppType node
+PassengerStartupFile server.js
+PassengerFriendlyErrorPages off
+
+# (optional) don’t expose dotfiles like .git/.env
+<FilesMatch "^\.">
+  Require all denied
+</FilesMatch>

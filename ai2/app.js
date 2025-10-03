@@ -292,6 +292,19 @@ function handler(req, res) {
   if (req.method === 'GET' && (p === '/ai2/_health' || p === '/_health')) {
     return sendJSON(res, 200, { ok:true, time: nowISO() });
   }
+  
+  const VERSION_FILE = path.join(__dirname, 'VERSION.txt');
+if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
+  let rev = 'unknown'; try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
+  return sendJSON(res, 200, { ok:true, version: rev });
+}
+  
+  const VERSION_FILE = path.join(__dirname, 'VERSION.txt');
+if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
+  let rev = 'unknown'; try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
+  return sendJSON(res, 200, { ok:true, version: rev });
+}
+
   // compatibility: /ai2/health and /health -> same as /ai2/_health
   if (req.method === 'GET' && (p === '/ai2/health' || p === '/health')) {
     return sendJSON(res, 200, { ok:true, time: nowISO() });
