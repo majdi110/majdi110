@@ -5,14 +5,16 @@
  *
  * Endpoints:
  *   GET  /ai2/                 -> "AppJS ACTIVE"
- *   GET  /ai2/_health          -> { ok:true, time: ... }
+ *   GET  /ai2/_health          -> { ok:true, time }
  *   GET  /ai2/health           -> alias of /ai2/_health
+ *   GET  /ai2/version          -> { ok:true, version }
  *   GET  /ai2/static/<file>    -> serve ./public/<file> (json/text only)
- *   POST /ai2/diff_submit      -> enqueue a Base64 (or base64url) unified diff
  *   POST /ai2/echo             -> debug echo; shows headers/body + decoded preview
+ *   POST /ai2/diff_submit      -> enqueue a Base64 (or base64url) unified diff
+ *   POST /ai2/diff_dryrun      -> git-apply --check (no enqueue), against origin/<base_branch>
  *
  * Notes
- * - Only accepts application/json bodies for /ai2/diff_submit:
+ * - /ai2/diff_submit body (application/json):
  *     { base_branch:"main", message?: "...", diff_b64:"<base64>", idempotency_key? }
  * - Auth for /ai2/diff_submit:
  *     Header X-Api-Key must equal token in /home/genweb/agent/ACTION_TOKEN
@@ -23,15 +25,20 @@
 
 const http   = require('http');
 const fs     = require('fs');
+const fsp    = require('fs/promises');
 const path   = require('path');
 const crypto = require('crypto');
 const url    = require('url');
+const os     = require('os');
+const { execFile } = require('child_process');
 
 // --- config/paths ---
 const TOKEN_FILE  = '/home/genweb/agent/ACTION_TOKEN';
 const QUEUE_DIR   = '/home/genweb/agent/queue';
+const IDEM_DIR    = QUEUE_DIR; // idempotency markers live alongside jobs
 const DEBUG_LOG   = '/home/genweb/agent/last_action_debug.log';
 const STATIC_ROOT = path.join(__dirname, 'public');
+const VERSION_FILE = path.join(__dirname, 'VERSION.txt'); // <— define ONCE
 const MAX_BYTES   = 512 * 1024;
 
 // --- state/init ---
@@ -48,7 +55,7 @@ const ts      = () => {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth()+1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
 };
 const r4      = () => crypto.randomBytes(2).toString('hex');
-const sha256  = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+const sha256S = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 const logDbg  = (objOrStr) => {
   try {
     const line = typeof objOrStr === 'string' ? objOrStr : JSON.stringify(objOrStr);
@@ -92,7 +99,10 @@ function sendText(res, code, text) {
 }
 
 // --- core validation for diffs ---
-function validateBase64Chars(b64){return /^[A-Za-z0-9+/_=-]+.test(String(b64||""));}
+function validateBase64Chars(b64) {
+  // allow std + url-safe: A-Za-z0-9+/_= and dash
+  return /^[A-Za-z0-9+/_=-]+$/.test(b64);
+}
 function containsControlBytes(s) {
   // reject any control chars except \t \n \r
   return /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(s);
@@ -161,6 +171,7 @@ function serveStatic(req, res, parsedPathname) {
     if (/\.json$/i.test(real)) ct = 'application/json; charset=UTF-8';
     else if (/\.txt$/i.test(real)) ct = 'text/plain; charset=UTF-8';
     else if (/\.log$/i.test(real)) ct = 'text/plain; charset=UTF-8';
+    else return sendText(res, 415, 'Unsupported Media Type\n');
 
     const data = fs.readFileSync(real);
     res.writeHead(200, { 'Content-Type': ct, 'Cache-Control': 'no-cache' });
@@ -194,7 +205,7 @@ function handleEcho(req, res) {
 
 function handleDiffSubmit(req, res) {
   // --- auth ---
-  const apiKey = req.headers['x-api-key']; // Node lowercases header names
+  const apiKey = req.headers['x-api-key'];
   if (!ACTION_TOKEN || apiKey !== ACTION_TOKEN) {
     return sendJSON(res, 401, { ok:false, error:'unauthorized' });
   }
@@ -243,7 +254,7 @@ function handleDiffSubmit(req, res) {
     // --- idempotency dedupe ---
     let idemPointerFile = '';
     if (idemVal) {
-      const idemFile = path.join(QUEUE_DIR, `.idem-${idemSan(idemVal)}`);
+      const idemFile = path.join(IDEM_DIR, `.idem-${idemSan(idemVal)}`);
       idemPointerFile = idemFile;
       if (fs.existsSync(idemFile)) {
         const existing = (fs.readFileSync(idemFile) + '').trim();
@@ -262,7 +273,7 @@ function handleDiffSubmit(req, res) {
       base_branch: base,
       message: (rawMessage || `ChatGPT change ${nowISO()}`),
       diff,
-      sha256: sha256(diff)
+      sha256: sha256S(diff)
     };
 
     try {
@@ -278,6 +289,71 @@ function handleDiffSubmit(req, res) {
   });
 }
 
+function execp(cmd, args, opts={}) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 16*1024*1024, ...(opts||{}) }, (err, stdout, stderr) => {
+      if (err) { err.stdout = String(stdout||''); err.stderr = String(stderr||''); return reject(err); }
+      resolve({ stdout: String(stdout||''), stderr: String(stderr||'') });
+    });
+  });
+}
+
+async function handleDiffDryrun(req, res) {
+  const ct = (req.headers['content-type'] || '').toLowerCase();
+  if (!ct.includes('application/json')) {
+    return sendJSON(res, 415, { ok:false, error:'unsupported_media_type' });
+  }
+
+  readBody(req, async (err, buf) => {
+    if (err) return sendJSON(res, err.code === 413 ? 413 : 400, { ok:false, error: err.message || 'read_error' });
+    let body = {};
+    try { body = JSON.parse(buf.toString('utf8') || '{}'); }
+    catch { return sendJSON(res, 400, { ok:false, error:'invalid_json' }); }
+
+    const base_branch = body.base_branch ? String(body.base_branch) : 'main';
+    const diff_b64 = body.diff_b64 ? String(body.diff_b64) : '';
+    if (!diff_b64) return sendJSON(res, 400, { ok:false, error:'missing diff_b64' });
+
+    // decode (accept url-safe)
+    const patchText = fromAnyB64(diff_b64);
+    if (!patchText) return sendJSON(res, 400, { ok:false, error:'diff_b64: decode error or empty' });
+    const patchBuf = Buffer.from(patchText, 'utf8');
+    if (patchBuf.length > 5 * 1024 * 1024) return sendJSON(res, 413, { ok:false, error:'patch too large (>5MB)' });
+
+    // quick structural validation first
+    const v = validateUnifiedDiff(patchText);
+    if (!v.ok) return sendJSON(res, 400, { ok:false, error: v.error });
+
+    const repo = __dirname;
+    const tmpDir = path.join(os.tmpdir(), `ai2-dryrun-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await fsp.mkdir(tmpDir, { recursive:true });
+
+      // make sure we have the latest base
+      await execp('git', ['fetch', '--depth=1', 'origin', base_branch], { cwd: repo });
+
+      // create a detached worktree at the remote branch tip (no changes to live tree)
+      await execp('git', ['worktree', 'add', '--detach', '--force', tmpDir, `origin/${base_branch}`], { cwd: repo });
+
+      const patchPath = path.join(tmpDir, 'incoming.patch');
+      await fsp.writeFile(patchPath, patchBuf);
+
+      try {
+        // --check = no changes; --3way = tolerate small context drift
+        await execp('git', ['apply', '--check', '--3way', '--unsafe-paths', patchPath], { cwd: tmpDir });
+        return sendJSON(res, 200, { ok:true });
+      } catch (e) {
+        return sendJSON(res, 422, { ok:false, error:'git apply --check failed', detail: e.stderr || e.stdout || String(e) });
+      } finally {
+        try { await execp('git', ['worktree', 'remove', '--force', tmpDir], { cwd: repo }); } catch {}
+      }
+    } catch (e) {
+      try { await execp('git', ['worktree', 'remove', '--force', tmpDir], { cwd: repo }); } catch {}
+      return sendJSON(res, 500, { ok:false, error: e.message || String(e) });
+    }
+  });
+}
+
 // --- router ---
 function handler(req, res) {
   const p = (url.parse(req.url).pathname || '');
@@ -289,24 +365,15 @@ function handler(req, res) {
   if (req.method === 'GET' && (p === '/ai2/_health' || p === '/_health')) {
     return sendJSON(res, 200, { ok:true, time: nowISO() });
   }
-  
-const VERSION_FILE = path.join(__dirname, 'VERSION.txt');
-
-if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
-  let rev = 'unknown';
-  try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
-  return sendJSON(res, 200, { ok:true, version: rev });
-}
-
-  
-if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
-  let rev = 'unknown'; try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
-  return sendJSON(res, 200, { ok:true, version: rev });
-}
-
-  // compatibility: /ai2/health and /health -> same as /ai2/_health
   if (req.method === 'GET' && (p === '/ai2/health' || p === '/health')) {
     return sendJSON(res, 200, { ok:true, time: nowISO() });
+  }
+
+  // version
+  if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
+    let rev = 'unknown';
+    try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
+    return sendJSON(res, 200, { ok:true, version: rev });
   }
 
   // echo
@@ -314,9 +381,14 @@ if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
     return handleEcho(req, res);
   }
 
-  // submit diff
+  // submit diff (auth required)
   if (req.method === 'POST' && (p === '/ai2/diff_submit' || p === '/diff_submit')) {
     return handleDiffSubmit(req, res);
+  }
+
+  // dryrun (no auth; it's safe validation only)
+  if (req.method === 'POST' && (p === '/ai2/diff_dryrun' || p === '/diff_dryrun')) {
+    return handleDiffDryrun(req, res);
   }
 
   // root banner (quick check)
