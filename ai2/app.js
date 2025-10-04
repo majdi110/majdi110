@@ -92,10 +92,7 @@ function sendText(res, code, text) {
 }
 
 // --- core validation for diffs ---
-function validateBase64Chars(b64) {
-  // allow std + url-safe: A-Za-z0-9+/_= and dash
-  return /^[A-Za-z0-9+/_=-]+$/.test(b64);
-}
+function validateBase64Chars(b64){return /^[A-Za-z0-9+/_=-]+.test(String(b64||""));}
 function containsControlBytes(s) {
   // reject any control chars except \t \n \r
   return /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(s);
@@ -302,7 +299,6 @@ if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
 }
 
   
-  const VERSION_FILE = path.join(__dirname, 'VERSION.txt');
 if (req.method === 'GET' && (p === '/ai2/version' || p === '/version')) {
   let rev = 'unknown'; try { rev = fs.readFileSync(VERSION_FILE, 'utf8').trim(); } catch {}
   return sendJSON(res, 200, { ok:true, version: rev });
