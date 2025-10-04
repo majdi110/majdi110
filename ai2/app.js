@@ -406,5 +406,3 @@ http.createServer(handler).listen(PORT, () => {
   logDbg({ tag: 'boot', time: nowISO(), msg: `listening PORT=${PORT}` });
 });
 
-// AI2 routes hook
-try { require("./ai2-routes")(module.exports || require("express")()); } catch(e) { try{ const a=require("express")(); require("./ai2-routes")(a);}catch(_){} }
