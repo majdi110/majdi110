@@ -11,11 +11,11 @@ const GET_MAX_BYTES  = 256 * 1024;
 const HIDDEN_DIRS = new Set(['.git','node_modules','.cache','.cpanel','.trash']);
 const HIDDEN_TOP  = new Set(['.git','node_modules','.env']);
 
-function readToken(){
+function readToken() {
   try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); }
   catch { return ''; }
 }
-function authOk(req, res){
+function authOk(req, res) {
   const expected = readToken();
   const h = req.headers.authorization || '';
   const tok = h.toLowerCase().startsWith('bearer ') ? h.slice(7) : '';
@@ -32,8 +32,10 @@ function safeJoin(root, user){
 function isHiddenName(n){ return n.startsWith('.') && !['.htaccess','.htpasswd'].includes(n); }
 
 module.exports = function(app){
-  // POST /ai2  -> enqueue a diff job
+  // JSON body parser for POST /ai2
   app.use(require('express').json({ limit: '1mb' }));
+
+  // POST /ai2  -> enqueue a diff job
   app.post('/ai2', (req, res) => {
     if (!authOk(req, res)) return;
     const { base_branch, message, diff, diff_b64 } = req.body || {};
@@ -91,7 +93,12 @@ module.exports = function(app){
         const relp = path.posix.join(prefix, e.name);
         try {
           const st = fs.statSync(abs);
-          out.push({ path: relp, type: e.isDirectory() ? 'dir' : 'file', size: st.size, mtime: Math.floor(st.mtimeMs / 10
+          out.push({
+            path: relp,
+           
+            size: st.size,
+            mtime: Math.floor(st.mtimeMs / 1000)
+          });
           if (e.isDirectory() && d > 0) out.push(...walk(abs, d - 1, relp));
         } catch {}
       }
@@ -118,3 +125,4 @@ module.exports = function(app){
     res.json({ path: rel, size: buf.length, mtime: Math.floor(st.mtimeMs / 1000), content_b64: buf.toString('base64') });
   });
 };
+
